@@ -6,7 +6,7 @@ import pytest
 from omegaconf import OmegaConf
 
 from zotero_arxiv_daily.executor import Executor, normalize_path_patterns
-from zotero_arxiv_daily.protocol import CorpusPaper
+from zotero_arxiv_daily.protocol import CorpusPaper, Paper
 
 
 # ---------------------------------------------------------------------------
@@ -188,8 +188,14 @@ def test_run_end_to_end(config, monkeypatch):
 
     monkeypatch.setattr(
         registered_retrievers["arxiv"],
-        "retrieve_papers",
+        "retrieve_candidates",
         lambda self: retrieved,
+    )
+    # Full text is now fetched after reranking; keep that step offline too.
+    monkeypatch.setattr(
+        registered_retrievers["arxiv"],
+        "hydrate",
+        lambda self, papers: papers,
     )
 
     # 4. Stub SMTP
@@ -233,7 +239,7 @@ def test_run_no_papers_send_empty_false(config, monkeypatch):
 
     from zotero_arxiv_daily.retriever.base import registered_retrievers
 
-    monkeypatch.setattr(registered_retrievers["arxiv"], "retrieve_papers", lambda self: [])
+    monkeypatch.setattr(registered_retrievers["arxiv"], "retrieve_candidates", lambda self: [])
 
     sent = []
     monkeypatch.setattr(smtplib, "SMTP", make_stub_smtp(sent))
@@ -269,7 +275,7 @@ def test_run_no_papers_send_empty_true(config, monkeypatch):
 
     from zotero_arxiv_daily.retriever.base import registered_retrievers
 
-    monkeypatch.setattr(registered_retrievers["arxiv"], "retrieve_papers", lambda self: [])
+    monkeypatch.setattr(registered_retrievers["arxiv"], "retrieve_candidates", lambda self: [])
 
     sent = []
     monkeypatch.setattr(smtplib, "SMTP", make_stub_smtp(sent))
@@ -281,3 +287,48 @@ def test_run_no_papers_send_empty_true(config, monkeypatch):
     assert len(sent) == 1, "Email should be sent even with no papers when send_empty=true"
     _, _, body = sent[0]
     assert "text/html" in body
+
+
+# ---------------------------------------------------------------------------
+# hydrate_papers — expensive work runs per source, after reranking
+# ---------------------------------------------------------------------------
+
+
+class _RecordingRetriever:
+    """Stands in for a real retriever and records what it was asked to hydrate."""
+
+    def __init__(self):
+        self.calls: list[list[str]] = []
+
+    def hydrate(self, papers):
+        self.calls.append([p.title for p in papers])
+        for paper in papers:
+            paper.full_text = f"text of {paper.title}"
+        return papers
+
+
+def _paper(source: str, title: str) -> Paper:
+    return Paper(source=source, title=title, authors=[], abstract="abs", url=f"https://x/{title}")
+
+
+def test_hydrate_papers_groups_by_source_and_preserves_rerank_order():
+    arxiv, biorxiv = _RecordingRetriever(), _RecordingRetriever()
+    executor = Executor.__new__(Executor)
+    executor.retrievers = {"arxiv": arxiv, "biorxiv": biorxiv}
+    papers = [_paper("arxiv", "a1"), _paper("biorxiv", "b1"), _paper("arxiv", "a2")]
+
+    result = executor.hydrate_papers(papers)
+
+    # Grouping must not reorder what the reranker produced.
+    assert [p.title for p in result] == ["a1", "b1", "a2"]
+    # One grouped call per source, not one call per paper.
+    assert arxiv.calls == [["a1", "a2"]]
+    assert biorxiv.calls == [["b1"]]
+    assert all(p.full_text for p in result)
+
+
+def test_hydrate_papers_accepts_empty_list():
+    executor = Executor.__new__(Executor)
+    executor.retrievers = {}
+
+    assert executor.hydrate_papers([]) == []

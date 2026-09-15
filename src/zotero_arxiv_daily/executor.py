@@ -3,7 +3,8 @@ from pyzotero import zotero
 from omegaconf import DictConfig, ListConfig
 from .utils import glob_match
 from .retriever import get_retriever_cls
-from .protocol import CorpusPaper
+from .protocol import CorpusPaper, Paper
+from collections import defaultdict
 import random
 from datetime import datetime
 from .reranker import get_reranker_cls
@@ -90,6 +91,20 @@ class Executor:
         return corpus
 
     
+    def hydrate_papers(self, papers: list[Paper]) -> list[Paper]:
+        """Let every source fill in the expensive fields of its selected papers.
+
+        Retrievers mutate the papers in place, so ``papers`` keeps the order
+        the reranker produced even though the work is grouped by source.
+        """
+        by_source: dict[str, list[Paper]] = defaultdict(list)
+        for paper in papers:
+            by_source[paper.source].append(paper)
+        for source, source_papers in by_source.items():
+            logger.info(f"Fetching full content of {len(source_papers)} {source} papers...")
+            self.retrievers[source].hydrate(source_papers)
+        return papers
+
     def run(self):
         corpus = self.fetch_zotero_corpus()
         corpus = self.filter_corpus(corpus)
@@ -99,7 +114,7 @@ class Executor:
         all_papers = []
         for source, retriever in self.retrievers.items():
             logger.info(f"Retrieving {source} papers...")
-            papers = retriever.retrieve_papers()
+            papers = retriever.retrieve_candidates()
             if len(papers) == 0:
                 logger.info(f"No {source} papers found")
                 continue
@@ -111,6 +126,7 @@ class Executor:
             logger.info("Reranking papers...")
             reranked_papers = self.reranker.rerank(all_papers, corpus)
             reranked_papers = reranked_papers[:self.config.executor.max_paper_num]
+            self.hydrate_papers(reranked_papers)
             logger.info("Generating TLDR and affiliations...")
             for p in tqdm(reranked_papers):
                 p.generate_tldr(self.openai_client, self.config.llm)

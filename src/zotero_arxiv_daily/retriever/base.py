@@ -36,6 +36,25 @@ class BaseRetriever(ABC):
             sleep(1)
         return papers
 
+    def retrieve_candidates(self) -> list[Paper]:
+        """Return rerank candidates without doing the expensive per-paper work.
+
+        Reranking scores papers by ``abstract`` alone, so a source that can list
+        abstracts cheaply should override this and defer downloads to
+        :meth:`hydrate`.  The default keeps the old behaviour: do everything up
+        front.
+        """
+        return self.retrieve_papers()
+
+    def hydrate(self, papers: list[Paper]) -> list[Paper]:
+        """Fill in the expensive fields (full text, ...) of the selected papers.
+
+        Called only for the papers that survived reranking.  The default is a
+        no-op, which is correct for retrievers whose ``retrieve_candidates``
+        already returns fully populated papers.
+        """
+        return papers
+
 registered_retrievers = {}
 
 def register_retriever(name:str):
