@@ -88,3 +88,50 @@ def test_run_with_hard_timeout_returns_none_on_failure(monkeypatch):
     )
     assert result is None
     assert "boom" in warnings[0]
+
+
+def test_retrieve_raw_papers_skips_batch_after_transient_http_errors(config, mock_feedparser, monkeypatch):
+    config.executor.debug = True
+    attempts = {"count": 0}
+    warnings: list[str] = []
+
+    class FakeClient:
+        def __init__(self, **kw):
+            pass
+
+        def results(self, search):
+            attempts["count"] += 1
+            raise arxiv_retriever.arxiv.HTTPError("https://example.com", attempts["count"], 429)
+
+    monkeypatch.setattr(arxiv_retriever.arxiv, "Client", FakeClient)
+    monkeypatch.setattr(arxiv_retriever, "sleep", lambda _: None)
+    monkeypatch.setattr(arxiv_retriever, "logger", SimpleNamespace(warning=warnings.append))
+
+    retriever = ArxivRetriever(config)
+    raw_papers = retriever._retrieve_raw_papers()
+
+    assert raw_papers == []
+    assert attempts["count"] == 5
+    assert any("Skipping batch" in warning for warning in warnings)
+
+
+def test_retrieve_raw_papers_raises_on_non_transient_http_error(config, mock_feedparser, monkeypatch):
+    config.executor.debug = True
+
+    class FakeClient:
+        def __init__(self, **kw):
+            pass
+
+        def results(self, search):
+            raise arxiv_retriever.arxiv.HTTPError("https://example.com", 0, 400)
+
+    monkeypatch.setattr(arxiv_retriever.arxiv, "Client", FakeClient)
+    monkeypatch.setattr(arxiv_retriever, "sleep", lambda _: None)
+
+    retriever = ArxivRetriever(config)
+
+    try:
+        retriever._retrieve_raw_papers()
+        raise AssertionError("Expected HTTPError")
+    except arxiv_retriever.arxiv.HTTPError as exc:
+        assert exc.status == 400
